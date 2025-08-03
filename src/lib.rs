@@ -1,25 +1,54 @@
 #![feature(generic_const_exprs)]
-#![feature(core_intrinsics)]
 
-mod examples;
+use std::hint;
+use constraints::{NonZero, ConstIndex, WithinBounds, ConstNum};
 
-/// a representation of a compile-time index
-/// 
-/// supports the concept of reverse indices -- e.g. -1 representing the last element -- by setting the `REVERSE` flag
-pub struct SafeIndex<const I: usize, const REVERSE: bool>;
+mod use_cases;
+mod constraints;
 
 /// a wrapper around a mutable vector reference, allowing for compile-time bounds checks
+/// 
+/// `'vec`: The lifetime of the wrapped vector. This is used as normal with reference fields, 
+/// but also enables us to explicitly return references to vector elements that outlive the sandboxed scope
+/// 
+/// `MIN_LEN`: The minimum length that this vector is guaranteed to be at compile-time.
+/// The vector may be longer than this, but this allows guaranteed access to up to `MIN_LEN` elements without checking at runtime.
+///
+/// For example, if `MIN_LEN` is 2, we can safely retrieve the `first()` and `last()` element. We can also safely `pop()`, and `get()` indices 0, 1, -1, and -2.
 pub struct SandboxMut<'vec, const MIN_LEN: usize, T> {
     vec: &'vec mut Vec<T>,
 }
 
 impl<'vec, const MIN_LEN: usize, T> SandboxMut<'vec, MIN_LEN, T> {
 
+    /// returns a reference to a constant index that is assumed to be valid
+    /// 
+    /// Safety: as long as the provided `INDEX` is guaranteed to be valid at compile time, this function is safe to use
+    unsafe fn get_checked_index<const INDEX: isize>(vec: &Vec<T>) -> &T {
+        if INDEX < 0 {
+           vec.get_unchecked(vec.len() - INDEX.unsigned_abs())
+        } else {
+            vec.get_unchecked(INDEX as usize)
+        }
+    }
+
+    /// returns a mutable reference to a constant index that is assumed to be valid
+    ///
+    /// Safety: as long as the provided `INDEX` is guaranteed to be valid at compile time, this function is safe to use
+    unsafe fn get_mut_checked_index<const INDEX: isize>(vec: &mut Vec<T>) -> &mut T {
+        if INDEX < 0 {
+            let len = vec.len();
+            vec.get_unchecked_mut(len - INDEX.unsigned_abs())
+        } else {
+            vec.get_unchecked_mut(INDEX as usize)
+        }
+    }
+    
     /// accepts a positive or negative constant index and returns a reference to the element at that index.
     /// 
     /// bounds checks are performed at compile time to ensure the index is valid
     /// 
-    /// Example:
+    /// Usage:
     /// ```
     /// use vec_sandbox::Sandboxed;
     /// 
@@ -33,24 +62,20 @@ impl<'vec, const MIN_LEN: usize, T> SandboxMut<'vec, MIN_LEN, T> {
     /// let last_val: &usize = sandbox.get::<-1>();
     /// println!("Last value: {}", last_val);
     /// ```
-    pub fn get<const INDEX: isize>(&self) -> &T where (
-        SafeIndex<{ INDEX.unsigned_abs() }, { INDEX < 0 }>,
-        _Num<MIN_LEN>
-    ): WithinBounds<true> {
-        let index_usize: usize = INDEX.unsigned_abs();
-        if INDEX < 0 {
-            self.vec.get(self.vec.len() - index_usize).unwrap()
-        } else {
-            self.vec.get(index_usize).unwrap()
+    pub fn get<const INDEX: isize>(&self) -> &T where
+        (ConstIndex<{ INDEX.unsigned_abs() }, { INDEX < 0 }>, ConstNum<MIN_LEN>): WithinBounds<true>
+    {
+        unsafe {
+            Self::get_checked_index::<INDEX>(self.vec)
         }
     }
-    
+
     /// takes ownership of the sandbox and returns a reference to the element in the underlying vector,
-    /// which may be safely returned from the sandbox's enclosing function
+    /// which outlives the sandbox instance and can be safely returned from an enclosing function
     /// 
-    /// otherwise performs the same as `get()`, accepting a positive or negative constant index
+    /// otherwise performs the same action as `get()`, accepting a positive or negative constant index
     ///
-    /// Example:
+    /// Usage:
     /// ```
     /// use vec_sandbox::Sandboxed;
     ///
@@ -60,28 +85,46 @@ impl<'vec, const MIN_LEN: usize, T> SandboxMut<'vec, MIN_LEN, T> {
     ///         .return_get::<-1>() // .get::<-1>() returns a reference bound to the lifetime of the sandbox, not the backing vector
     /// }
     /// ```
-    pub fn return_get<const INDEX: isize>(self) -> &'vec T where (
-             SafeIndex<{ INDEX.unsigned_abs() }, { INDEX < 0 }>,
-             _Num<MIN_LEN>
-         ): WithinBounds<true> {
-        let index_usize: usize = INDEX.unsigned_abs();
-        if INDEX < 0 {
-            self.vec.get(self.vec.len() - index_usize).unwrap()
-        } else {
-            self.vec.get(index_usize).unwrap()
+    pub fn return_get<const INDEX: isize>(self) -> &'vec T where
+        (ConstIndex<{ INDEX.unsigned_abs() }, { INDEX < 0 }>, ConstNum<MIN_LEN>): WithinBounds<true>
+    {
+        unsafe {
+            Self::get_checked_index::<INDEX>(self.vec)
+        }
+    }
+
+    pub fn swap<const LEFT_INDEX: isize, const RIGHT_INDEX: isize>(&mut self) where
+        (ConstIndex<{ LEFT_INDEX.unsigned_abs() }, { LEFT_INDEX < 0 }>, ConstNum<MIN_LEN>): WithinBounds<true>,
+        (ConstIndex<{ RIGHT_INDEX.unsigned_abs() }, { RIGHT_INDEX < 0 }>, ConstNum<MIN_LEN>): WithinBounds<true>
+    {
+        self.vec.swap(LEFT_INDEX as usize, RIGHT_INDEX as usize)
+    }
+
+    pub fn return_get_mut<const INDEX: isize>(self) -> &'vec mut T where (
+        ConstIndex<{ INDEX.unsigned_abs() }, { INDEX < 0 }>,
+        ConstNum<MIN_LEN>
+    ): WithinBounds<true> {
+        unsafe {
+            Self::get_mut_checked_index::<INDEX>(self.vec)
         }
     }
 
     /// takes ownership of this sandbox, pushes the value to the underlying vector, 
     /// and returns a new sandbox with an incremented guaranteed length
     /// 
-    /// Most conducive to chained method calls
+    /// This pattern is most conducive to chained method calls like 
     /// ```
-    /// vec![].sandboxed().push(1).push(2)
+    /// use vec_sandbox::Sandboxed;
+    /// 
+    /// let mut vec = vec![];
+    /// vec.sandboxed().push(1).push(2)
     /// ```
     /// but can also take advantage of variable shadowing / re-definition
     /// ```
-    /// let sandbox = vec![].sandboxed();
+    /// use vec_sandbox::Sandboxed;
+    /// 
+    /// let mut vec = vec![];
+    /// let sandbox = vec.sandboxed();
     /// let sandbox = sandbox.push(1);
     /// let sandbox = sandbox.push(2);
     /// ```
@@ -92,18 +135,19 @@ impl<'vec, const MIN_LEN: usize, T> SandboxMut<'vec, MIN_LEN, T> {
         }
     }
     
-    /// Example:
+    /// Performs a runtime check to provide compile-time guarantees about the `MIN_LEN` of a vector in the resulting `Ok` path.
     /// 
+    /// Usage:
     /// ```
     /// use vec_sandbox::Sandboxed;
-    /// 
-    /// let mut vec: Vec<&str> = vec!["one", "two", "three"];
-    /// 
+    ///
+    /// let mut vec = vec!["one", "two", "three"];
+    ///
     /// // the guaranteed length of the sandbox is 1,
     /// // since we've performed one sandboxed `push` operation
     /// let sandboxed = vec.sandboxed().push("four"); 
-    /// 
-    /// match sandboxed.check_len::<3>() {
+    ///
+    /// match sandboxed.try_guarantee_length::<3>() {
     ///     // case if the length of the sandbox is at least 3 elements
     ///     // the sandbox instance bound here has a guaranteed length of 3, so we can safely use indices -3 ..= 2
     ///     Ok(at_least_3) => {
@@ -119,9 +163,9 @@ impl<'vec, const MIN_LEN: usize, T> SandboxMut<'vec, MIN_LEN, T> {
     ///     }
     /// }
     /// ```
-    pub fn check_len<const LEN: usize>(self) -> Result<SandboxMut<'vec, LEN, T>, Self> {
+    pub fn try_guarantee_length<const LEN: usize>(self) -> Result<SandboxMut<'vec, LEN, T>, Self> {
         unsafe {
-            core::hint::assert_unchecked(self.vec.len() > MIN_LEN);
+            hint::assert_unchecked(self.vec.len() >= MIN_LEN);
         }
         match self.vec.len() >= LEN {
             true => Ok(SandboxMut {
@@ -132,36 +176,31 @@ impl<'vec, const MIN_LEN: usize, T> SandboxMut<'vec, MIN_LEN, T> {
     }
 }
 
-pub struct _Num<const N: usize>;
-
-pub trait NonZero<const TRUE: bool> {}
-impl<const N: usize> NonZero<{ N > 0}> for _Num<N> {}
-
-const fn within_bounds(min: usize, max_exclusive: usize, index: usize) -> bool {
-    index >= min && index < max_exclusive
-}
-
-pub trait WithinBounds<const TRUE: bool> {}
-
-impl<const INDEX: usize, const LENGTH: usize> WithinBounds<{ within_bounds(0, LENGTH, INDEX) }> for (
-    SafeIndex<INDEX, false>,
-    _Num<LENGTH>
-) {}
-
-// idx -1, actual len 5
-// 
-impl<const NEG_INDEX: usize, const LENGTH: usize> WithinBounds<{ within_bounds(1, LENGTH + 1, NEG_INDEX) }> for (
-    SafeIndex<NEG_INDEX, true>,
-    _Num<LENGTH>
-) {}
-
+/// A collection of vector methods that are valid as long as the vector has at least one element
+/// i.e. if the vector is non-empty, as the name would suggest.
+/// 
+/// Most methods that apply here are index-agnostic operations like first, last, and pop, 
+/// but there are likely other exploitations of the non-empty guarantee that we can explore
 pub trait NonEmptyOps<'vec, const MIN_LEN: usize, T> {
+    /// retrieves a reference to the first value in the vector
     fn first(&'vec self) -> &'vec T;
+
+    /// retrieves a reference to the last value in the vector
     fn last(&self) -> &T;
+
+    /// removes the last value in the vector and a tuple containing the new sandbox and the removed value
+    /// 
+    /// Usage:
+    /// ```
+    /// let mut vec = vec![];
+    /// let sandboxed = vec.sandboxed().push(1);
+    /// let (sandboxed, removed_value) = sandboxed.pop();
+    /// ```
     fn pop(self) -> (SandboxMut<'vec, { MIN_LEN - 1 }, T>, T);
 }
 
-impl<'vec, const MIN_LEN: usize, T> NonEmptyOps<'vec, MIN_LEN, T> for SandboxMut<'vec, MIN_LEN, T> where _Num<MIN_LEN>: NonZero<true> {
+impl<'vec, const MIN_LEN: usize, T> NonEmptyOps<'vec, MIN_LEN, T> for SandboxMut<'vec, MIN_LEN, T>
+where ConstNum<MIN_LEN>: NonZero<true> {
     fn first(&'vec self) -> &'vec T {
         self.vec.first().unwrap()
     }
@@ -180,45 +219,67 @@ impl<'vec, const MIN_LEN: usize, T> NonEmptyOps<'vec, MIN_LEN, T> for SandboxMut
     }
 }
 
+pub trait GuaranteedLength<'vec, T> where Self: 'vec {
+    fn with_min_length<const LEN: usize>(&'vec mut self) -> Option<SandboxMut<'vec, LEN, T>>;
+}
+
+impl<'vec, T, const MIN_LEN: usize> GuaranteedLength<'vec, T> for SandboxMut<'vec, MIN_LEN, T> {
+    fn with_min_length<const LEN: usize>(&'vec mut self) -> Option<SandboxMut<'vec, LEN, T>> {
+        unsafe {
+            hint::assert_unchecked(self.vec.len() >= MIN_LEN);
+        }
+        Some(SandboxMut {
+            vec: self.vec,
+        }).filter(move |sandbox| sandbox.vec.len() >= LEN)
+    }
+}
+
+impl<'vec, T> GuaranteedLength<'vec, T> for Vec<T> where Self: 'vec {
+    fn with_min_length<const LEN: usize>(&'vec mut self) -> Option<SandboxMut<'vec, LEN, T>> {
+        Some(SandboxMut {
+            vec: self,
+        }).filter(move |sandbox| sandbox.vec.len() >= LEN)
+    }
+}
+
+/// A trait used to add the sandbox methods to `Vec`
 pub trait Sandboxed<'vec, T> where T: 'vec {
+    /// gets a `SandboxMut` instance to allow for compile-time-checked operations on the given vector
+    /// 
+    /// Usage:
+    /// ```
+    /// use vec_sandbox::Sandboxed;
+    ///
+    /// let mut vec = vec!["first"];
+    /// let sandbox = vec.sandboxed();
+    /// let tail = sandbox.push("last").return_get::<-1>();
+    /// println!("{}", tail) // outputs "last"
+    /// ```
     fn sandboxed(&'vec mut self) -> SandboxMut<'vec, 0, T>;
+    /// runs the given closure with a `SandboxMut` instance referencing the given vector, allowing for compile-time-checked operations
+    /// 
+    /// Usage:
+    /// ```
+    /// use vec_sandbox::Sandboxed;
+    /// 
+    /// let mut vec = vec!["first"];
+    /// let tail = vec.sandboxed_scope(|sandbox| {
+    ///     sandbox.push("last").return_get::<-1>()
+    /// });
+    /// println!("{}", tail) // outputs "last"
+    /// ```
+    fn sandboxed_scope<R, F: FnOnce(SandboxMut<'vec, 0, T>) -> R>(&'vec mut self, sandboxed_fn: F) -> R;
+
+    
 }
 
 impl<'vec, T> Sandboxed<'vec, T> for Vec<T> where T: 'vec {
     fn sandboxed(&'vec mut self) -> SandboxMut<'vec, 0, T> {
         SandboxMut { vec: self }
     }
-}
 
-#[test]
-fn push_length_guarantee() {
-    let mut vec: Vec<&str> = vec![];
-    let sandboxed = vec.sandboxed()
-        .push("First");
-
-    println!("{}", sandboxed.first());
-    println!("{}", sandboxed.last());
-}
-
-#[test]
-fn runtime_check_narrowing() {
-    let mut vec: Vec<&str> = vec!["one", "two", "three"];
-    // the guaranteed length of the sandbox is 1,
-    // since we've performed one sandboxed `push` operation
-    let sandboxed = vec.sandboxed().push("four");
-    match sandboxed.check_len::<3>() {
-        // case if the length of the sandbox is at least 3 elements
-        // the sandbox instance bound here has a guaranteed length of 3, so we can safely use indices -3 ..= 2
-        Ok(at_least_3) => {
-            println!("{}", at_least_3.get::<2>()); // safely access the third element (index 2)
-            println!("{}", at_least_3.get::<-3>()); // safely access the third-to-last element (index -3 i.e. `len
-        }
-        // case if the length of the sandbox is less than 3 elements
-        // the sandbox instance bound here inherits the original guaranteed length of 1
-        Err(default) => {
-            println!("vec is less than 3, but at least 1");
-            println!("{}", default.get::<0>()); // safely access the first
-            println!("{}", default.get::<-1>()); // safely access the last element
-        }
+    fn sandboxed_scope<R, F: FnOnce(SandboxMut<'vec, 0, T>) -> R>(&'vec mut self, sandboxed_fn: F) -> R {
+        let sandbox = SandboxMut { vec: self };
+        sandboxed_fn(sandbox)
     }
 }
