@@ -72,7 +72,7 @@ impl SortedList {
                 // as it no longer satisfies the non-zero `MIN_LEN` requirement for `first()` and `last()` to be implemented.
 
                 // try commenting out the following line to watch this in action:
-                // let sandbox = sandbox.pop();
+                // let (sandbox, _) = sandbox.pop();
                 
                 self.bounds = Some((
                     *sandbox.first(),
