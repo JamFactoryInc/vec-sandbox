@@ -82,10 +82,10 @@ impl<'vec, const MIN_LEN: usize, T> SandboxMut<'vec, MIN_LEN, T> {
     /// fn push_and_get_reference(vec: &mut Vec<usize>) -> &usize {
     ///     vec.sandboxed()
     ///         .push(2)
-    ///         .return_get::<-1>() // .get::<-1>() returns a reference bound to the lifetime of the sandbox, not the backing vector
+    ///         .release_get::<-1>() // .get::<-1>() returns a reference bound to the lifetime of the sandbox, not the backing vector
     /// }
     /// ```
-    pub fn return_get<const INDEX: isize>(self) -> &'vec T where
+    pub fn release_get<const INDEX: isize>(self) -> &'vec T where
         (ConstIndex<{ INDEX.unsigned_abs() }, { INDEX < 0 }>, ConstNum<MIN_LEN>): WithinBounds<true>
     {
         unsafe {
@@ -100,7 +100,7 @@ impl<'vec, const MIN_LEN: usize, T> SandboxMut<'vec, MIN_LEN, T> {
         self.vec.swap(LEFT_INDEX as usize, RIGHT_INDEX as usize)
     }
 
-    pub fn return_get_mut<const INDEX: isize>(self) -> &'vec mut T where (
+    pub fn release_get_mut<const INDEX: isize>(self) -> &'vec mut T where (
         ConstIndex<{ INDEX.unsigned_abs() }, { INDEX < 0 }>,
         ConstNum<MIN_LEN>
     ): WithinBounds<true> {
@@ -220,10 +220,24 @@ where ConstNum<MIN_LEN>: NonZero<true> {
 }
 
 pub trait GuaranteedLength<'vec, T> where Self: 'vec {
+    /// Equivalent to `with_min_length::<1>()`
+    /// 
+    /// If valid at runtime, returns a Sandbox exposing operations available for non-empty collections
+    fn as_non_empty(&'vec mut self) -> Option<SandboxMut<'vec, 1, T>>;
+    
+    /// Checks the length of the collection at runtime
+    /// 
+    /// If the collection length is at least the indicated `LEN`, returns a Sandbox with `MIN_LEN` = `LEN`
     fn with_min_length<const LEN: usize>(&'vec mut self) -> Option<SandboxMut<'vec, LEN, T>>;
 }
 
 impl<'vec, T, const MIN_LEN: usize> GuaranteedLength<'vec, T> for SandboxMut<'vec, MIN_LEN, T> {
+    fn as_non_empty(&'vec mut self) -> Option<SandboxMut<'vec, 1, T>> {
+        Some(SandboxMut {
+            vec: self.vec,
+        }).filter(move |sandbox| sandbox.vec.len() >= 1)
+    }
+    
     fn with_min_length<const LEN: usize>(&'vec mut self) -> Option<SandboxMut<'vec, LEN, T>> {
         unsafe {
             hint::assert_unchecked(self.vec.len() >= MIN_LEN);
@@ -235,6 +249,12 @@ impl<'vec, T, const MIN_LEN: usize> GuaranteedLength<'vec, T> for SandboxMut<'ve
 }
 
 impl<'vec, T> GuaranteedLength<'vec, T> for Vec<T> where Self: 'vec {
+    fn as_non_empty(&'vec mut self) -> Option<SandboxMut<'vec, 1, T>> {
+        Some(SandboxMut {
+            vec: self,
+        }).filter(move |sandbox| sandbox.vec.len() >= 1)
+    }
+    
     fn with_min_length<const LEN: usize>(&'vec mut self) -> Option<SandboxMut<'vec, LEN, T>> {
         Some(SandboxMut {
             vec: self,
@@ -252,7 +272,7 @@ pub trait Sandboxed<'vec, T> where T: 'vec {
     ///
     /// let mut vec = vec!["first"];
     /// let sandbox = vec.sandboxed();
-    /// let tail = sandbox.push("last").return_get::<-1>();
+    /// let tail = sandbox.push("last").release_get::<-1>();
     /// println!("{}", tail) // outputs "last"
     /// ```
     fn sandboxed(&'vec mut self) -> SandboxMut<'vec, 0, T>;
@@ -261,10 +281,10 @@ pub trait Sandboxed<'vec, T> where T: 'vec {
     /// Usage:
     /// ```
     /// use vec_sandbox::Sandboxed;
-    /// 
+    ///
     /// let mut vec = vec!["first"];
     /// let tail = vec.sandboxed_scope(|sandbox| {
-    ///     sandbox.push("last").return_get::<-1>()
+    ///     sandbox.push("last").release_get::<-1>()
     /// });
     /// println!("{}", tail) // outputs "last"
     /// ```
